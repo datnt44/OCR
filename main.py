@@ -14,7 +14,7 @@ from sqlalchemy.orm import sessionmaker
 # --- CẤU HÌNH KẾT NỐI POSTGRESQL ---
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
-    DATABASE_URL = "postgresql://postgres:password@localhost:5432/ocr_db"
+    DATABASE_URL = "postgresql://postgres:ALTcgCCqAIjJCAwtcSVOFqdsBbNoBzyq@shinkansen.proxy.rlwy.net:57724/railway"
 
 # Ép chuỗi kết nối sử dụng đúng driver psycopg2 để tránh lỗi psycopg3
 if DATABASE_URL.startswith("postgres://"):
