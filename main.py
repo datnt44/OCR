@@ -1,6 +1,18 @@
 import os
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI()
+
+# Bật CORS để cho phép Netlify gọi API sang
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Cho phép mọi Domain gọi vào (hoặc thay bằng URL Netlify của bạn)
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 from pydantic import BaseModel
 import pymupdf as fitz
 import pytesseract
