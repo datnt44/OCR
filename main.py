@@ -1,20 +1,9 @@
 import os
+import traceback
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-
-app = FastAPI()
-
-# Bật CORS để cho phép Netlify gọi API sang
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Cho phép mọi Domain gọi vào (hoặc thay bằng URL Netlify của bạn)
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 from pydantic import BaseModel
-import pymupdf as fitz
+import pymupdf as fitz  # PyMuPDF chuẩn
 import pytesseract
 import cv2
 import numpy as np
@@ -22,20 +11,18 @@ from sqlalchemy import create_engine, Column, Integer, String, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
-# Lấy thông số kết nối PostgreSQL từ biến môi trường của Railway
+# --- CẤU HÌNH KẾT NỐI POSTGRESQL ---
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
-    # URL mặc định khi chạy test local (nếu cần)
     DATABASE_URL = "postgresql://postgres:password@localhost:5432/ocr_db"
 
-# Thêm tiền tố postgresql+psycopg2:// vào URL để ép dùng driver psycopg2
+# Ép chuỗi kết nối sử dụng đúng driver psycopg2 để tránh lỗi psycopg3
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
-elif DATABASE_URL.startswith("postgresql://"):
+elif DATABASE_URL.startswith("postgresql://") and "+psycopg2" not in DATABASE_URL:
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
 
 engine = create_engine(DATABASE_URL)
-
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -57,7 +44,7 @@ Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
 
-# Bật CORS để cho phép trang Netlify gọi API sang
+# Bật CORS đầy đủ để Netlify gọi sang không bị chặn
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -66,7 +53,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Danh sách danh mục mặt hàng chuẩn để đối chiếu
+# Danh sách mặt hàng mẫu để đối chiếu OCR
 STANDARD_ITEMS = [
     {"ma": "A26100001", "ten": "Nước tinh khiết Number 1 500ml", "dvt": "Chai"},
     {"ma": "A26100002", "ten": "Bánh bông lan Gibon 156g", "dvt": "Gói"},
@@ -105,10 +92,9 @@ async def process_pdf(file: UploadFile = File(...)):
                 if "Tiền còn:" in line or "Tiên còn:" in line:
                     tien_con = line.split(":")[-1].strip() + " đ"
 
-            # Gắn danh sách mặt hàng mẫu (hoặc bóc tách nâng cao theo OCR)
+            # Đối chiếu mặt hàng
             page_items = []
             for item in STANDARD_ITEMS:
-                # Nếu tên mặt hàng xuất hiện trong văn bản OCR thì mặc định gán số lượng = 1 (hoặc tùy chỉnh)
                 is_detected = item["ten"].lower() in text.lower()
                 page_items.append({
                     "ma": item["ma"],
@@ -118,20 +104,20 @@ async def process_pdf(file: UploadFile = File(...)):
                     "trangThai": "Khớp" if is_detected else "Nghi ngờ"
                 })
             
-            # Chỉ lọc lấy các mặt hàng có số lượng > 0 hoặc để hiển thị toàn bộ bảng
             filtered_items = [i for i in page_items if i["sl"] > 0]
 
             ocr_database[page_num + 1] = {
                 "ten": ten_khach,
                 "tienCon": tien_con,
-                "items": filtered_items if filtered_items else page_items[:3] # Mẫu hiển thị
+                "items": filtered_items if filtered_items else page_items[:3]
             }
 
         return {"total_pages": len(doc), "data": ocr_database}
+        
     except Exception as e:
+        print("LỖI OCR CHI TIẾT:", traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
 
-# Mô hình nhận dữ liệu lưu vào PostgreSQL
 class PageDataModel(BaseModel):
     page: int
     ten: str
@@ -142,10 +128,9 @@ class PageDataModel(BaseModel):
 async def save_page(data: PageDataModel):
     db = SessionLocal()
     try:
-        # Xóa dữ liệu cũ của trang này nếu có (tránh trùng lặp khi bấm lưu lại)
+        # Xóa dữ liệu cũ của trang này trước khi ghi mới để tránh trùng lặp
         db.query(PhieuMuaHang).filter(PhieuMuaHang.page == data.page).delete()
         
-        # Lưu các mặt hàng mới chỉnh sửa vào PostgreSQL
         for item in data.items:
             db_item = PhieuMuaHang(
                 page=data.page,
