@@ -1,9 +1,10 @@
 fastapi
 uvicorn
 python-multipart
-PyMuPDF
+pymupdf
 pytesseract
 opencv-python-headless
 numpy
+psycopg
 psycopg2-binary
 sqlalchemy
