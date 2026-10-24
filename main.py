@@ -35,7 +35,7 @@ app.add_middleware(
 
 @app.get("/")
 def read_root():
-    return {"status": "online", "message": "API is running successfully!"}
+    return {"status": "online", "message": "FastAPI PDF & Database Backend is running successfully!"}
 
 @app.post("/api/process-pdf")
 async def process_pdf(file: UploadFile = File(...)):
@@ -45,7 +45,7 @@ async def process_pdf(file: UploadFile = File(...)):
         doc = fitz.open(stream=contents, filetype="pdf")
         ocr_database = {}
 
-        # 1. TẢI TRƯỚC TOÀN BỘ DANH MỤC HÀNG HÓA TỪ BẢNG "danh muc hang trai 2"
+        # 1. TẢI TOÀN BỘ DANH MỤC HÀNG HÓA TỪ BẢNG "danh muc hang trai 2"
         master_items = []
         try:
             sql_items = text('SELECT "Mã hàng", "Tên hàng", "Đơn vị tính" FROM "danh muc hang trai 2";')
@@ -59,14 +59,28 @@ async def process_pdf(file: UploadFile = File(...)):
                     "trangThai": "Khớp DB"
                 })
         except Exception as e:
-            print(f"Lỗi đọc bảng 'danh muc hang trai 2': {str(e)}")
+            db.rollback() # Xóa trạng thái transaction bị hỏng nếu có lỗi
+            error_msg = str(e)
+            print(f"LỖI KHI ĐỌC BẢNG DANH MỤC: {error_msg}")
+            master_items = [{
+                "ma": "ERR", 
+                "ten": f"Lỗi bảng danh mục: {error_msg[:60]}", 
+                "dvt": "--", 
+                "sl": 0, 
+                "trangThai": "Lỗi DB"
+            }]
 
-        # Nếu bảng danh mục trống, dùng dữ liệu mẫu để giao diện không bị trắng
+        # Nếu bảng trống hoặc không có dữ liệu
         if not master_items:
-            master_items = [
-                {"ma": "ERR", "ten": "Không thể đọc dữ liệu từ bảng 'danh muc hang trai 2'", "dvt": "--", "sl": 0, "trangThai": "Lỗi DB"}
-            ]
+            master_items = [{
+                "ma": "TRONG", 
+                "ten": "Bảng 'danh muc hang trai 2' không có dữ liệu", 
+                "dvt": "--", 
+                "sl": 0, 
+                "trangThai": "Trống"
+            }]
 
+        # 2. XỬ LÝ TỪNG TRANG TRONG FILE PDF
         for page_num in range(len(doc)):
             page = doc[page_num]
             pix = page.get_pixmap(dpi=300)
@@ -78,7 +92,7 @@ async def process_pdf(file: UploadFile = File(...)):
             if img is None:
                 continue
 
-           # 2. ĐỌC MÃ QR CODE (TÌM THÔNG TIN TỪ BẢNG "_A2" THEO "STT")
+            # ĐỌC MÃ QR CODE (TÌM THÔNG TIN TỪ BẢNG "_A2" THEO CỘT "STT")
             qr_codes = decode_qr(img)
             ten_khach = "Không tìm thấy mã QR trên trang"
             tien_con = "0 đ"
@@ -86,7 +100,7 @@ async def process_pdf(file: UploadFile = File(...)):
             if qr_codes:
                 qr_data = qr_codes[0].data.decode('utf-8').strip()
                 try:
-                    # Thử truy vấn linh hoạt (hỗ trợ cả trường hợp STT là số hoặc chuỗi)
+                    # Truy vấn bảng _A2 với điều kiện "STT" khớp mã QR
                     sql_a2 = text('SELECT * FROM "_A2" WHERE "STT"::text = :stt LIMIT 1;')
                     a2_result = db.execute(sql_a2, {"stt": qr_data}).fetchone()
                     
@@ -95,7 +109,7 @@ async def process_pdf(file: UploadFile = File(...)):
                         found_name = None
                         found_money = None
                         
-                        # Tự động quét các cột chứa tên hoặc tiền trong bảng _A2
+                        # Tự động nhận diện các cột tên và tiền trong bảng _A2
                         for k, v in row_dict.items():
                             k_lower = k.lower()
                             if any(w in k_lower for w in ["ten", "họ tên", "hoten", "phamnhan", "ho_ten"]):
@@ -103,7 +117,7 @@ async def process_pdf(file: UploadFile = File(...)):
                             if any(w in k_lower for w in ["tien", "số tiền", "sotien", "con", "so_du"]):
                                 found_money = v
                         
-                        # Nếu không tìm thấy qua từ khóa, lấy mặc định cột thứ 2 hoặc thứ 3 trong bảng
+                        # Fallback lấy cột thứ 2 và thứ 3 nếu không khớp từ khóa
                         if not found_name and len(row_dict) > 1:
                             found_name = list(row_dict.values())[1]
                         if not found_money and len(row_dict) > 2:
@@ -114,11 +128,12 @@ async def process_pdf(file: UploadFile = File(...)):
                     else:
                         ten_khach = f"Mã QR [{qr_data}] không tồn tại trong bảng _A2"
                 except Exception as db_err:
-                    # In chi tiết lỗi SQL ra Terminal của Railway để debug
-                    print(f"CHI TIẾT LỖI SQL _A2 cho mã {qr_data}: {str(db_err)}")
-                    ten_khach = f"Lỗi SQL _A2: {str(db_err)[:40]}"
+                    db.rollback() # Làm sạch transaction để các lệnh sau không bị ảnh hưởng
+                    err_str = str(db_err)
+                    print(f"LỖI TRUY VẤN BẢNG _A2 cho QR [{qr_data}]: {err_str}")
+                    ten_khach = f"Lỗi _A2: {err_str[:50]}"
 
-            # Gán danh mục hàng hóa vào từng trang
+            # Gán dữ liệu cho từng trang
             ocr_database[page_num + 1] = {
                 "ten": ten_khach,
                 "tienCon": tien_con,
@@ -128,7 +143,8 @@ async def process_pdf(file: UploadFile = File(...)):
         return {"total_pages": len(doc), "data": ocr_database}
         
     except Exception as e:
-        print("LỖI XỬ LÝ PDF:", traceback.format_exc())
+        db.rollback()
+        print("LỖI XỬ LÝ CHUNG:", traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
@@ -143,6 +159,7 @@ class PageDataModel(BaseModel):
 async def save_page(data: PageDataModel):
     db = SessionLocal()
     try:
+        # Xóa dữ liệu cũ của trang trước khi lưu mới
         db.execute(text("DELETE FROM phieu_mua_hang WHERE page = :page"), {"page": data.page})
         
         for item in data.items:
@@ -162,9 +179,15 @@ async def save_page(data: PageDataModel):
             })
             
         db.commit()
-        return {"status": "success", "message": f"Đã lưu thành công dữ liệu trang {data.page}!"}
+        return {"status": "success", "message": f"Đã lưu thành công dữ liệu trang {data.page} vào cơ sở dữ liệu!"}
     except Exception as e:
         db.rollback()
+        print("LỖI KHI LƯU TRANG:", traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
