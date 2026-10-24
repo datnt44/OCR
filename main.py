@@ -2,18 +2,6 @@ import os
 import traceback
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-
-app = FastAPI()
-
-# Cấu hình CORS chuẩn để chấp nhận mọi request từ Netlify (bao gồm cả Preflight OPTIONS)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Cho phép tất cả các nguồn gọi vào
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["*"],
-)
-
 from pydantic import BaseModel
 import pymupdf as fitz  # PyMuPDF chuẩn
 import pytesseract
@@ -26,9 +14,9 @@ from sqlalchemy.orm import sessionmaker
 # --- CẤU HÌNH KẾT NỐI POSTGRESQL ---
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
-    DATABASE_URL = "postgresql://postgres:ALTcgCCqAIjJCAwtcSVOFqdsBbNoBzyq@shinkansen.proxy.rlwy.net:57724/railway"
+    DATABASE_URL = "postgresql://postgres:ALTcgCCqAIjJCAwtcSVOFqdsBbNoBzyq@postgres.railway.internal:5432/railway"
 
-# Ép chuỗi kết nối sử dụng đúng driver psycopg2 để tránh lỗi psycopg3
+# Ép chuỗi kết nối sử dụng đúng driver psycopg2
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
 elif DATABASE_URL.startswith("postgresql://") and "+psycopg2" not in DATABASE_URL:
@@ -56,12 +44,12 @@ Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
 
-# Bật CORS đầy đủ để Netlify gọi sang không bị chặn
+# Bật CORS đầy đủ để chấp nhận mọi request từ Netlify (kể cả Preflight OPTIONS)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -78,6 +66,10 @@ STANDARD_ITEMS = [
     {"ma": "A26100024", "ten": "Ruốc thịt 0,2kg", "dvt": "Túi"}
 ]
 
+@app.get("/")
+def read_root():
+    return {"status": "online", "message": "OCR Backend is running successfully!"}
+
 @app.post("/api/process-pdf")
 async def process_pdf(file: UploadFile = File(...)):
     try:
@@ -93,8 +85,14 @@ async def process_pdf(file: UploadFile = File(...)):
             nparr = np.frombuffer(img_bytes, np.uint8)
             img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
             
-            # Chạy Tesseract OCR tiếng Việt
-            text = pytesseract.image_to_string(img, lang='vie')
+            if img is None:
+                continue
+
+            # Chạy Tesseract OCR tiếng Việt an toàn
+            try:
+                text = pytesseract.image_to_string(img, lang='vie')
+            except Exception:
+                text = ""
             
             ten_khach = "Không rõ"
             tien_con = "0 đ"
@@ -127,7 +125,7 @@ async def process_pdf(file: UploadFile = File(...)):
         return {"total_pages": len(doc), "data": ocr_database}
         
     except Exception as e:
-        print("LỖI OCR CHI TIẾT:", traceback.format_exc())
+        print("LỖI XỬ LÝ PDF CHI TIẾT:", traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
 
 class PageDataModel(BaseModel):
@@ -166,7 +164,5 @@ async def save_page(data: PageDataModel):
 
 if __name__ == "__main__":
     import uvicorn
-    import os
-    # Lấy cổng PORT do Railway tự động cung cấp, nếu chạy local thì mặc định là 8000
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
