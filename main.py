@@ -13,7 +13,7 @@ from sqlalchemy.orm import sessionmaker
 # --- CẤU HÌNH KẾT NỐI POSTGRESQL ---
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
-    DATABASE_URL = "postgresql://postgres:ALTcgCCqAIjJCAwtcSVOFqdsBbNoBzyq@postgres.railway.internal:5432/railway"
+    DATABASE_URL = "postgresql://postgres:password@localhost:5432/ocr_db"
 
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
@@ -91,7 +91,7 @@ async def process_pdf(file: UploadFile = File(...)):
             if img is None:
                 continue
 
-            # ĐỌC MÃ QR CODE (CHÍNH LÀ "STT" TRONG BẢNG _A2 ĐỂ LẤY "Họ và tên")
+            # ĐỌC MÃ QR CODE (CHÍNH LÀ CỘT "STT" TRONG BẢNG _A2)
             qr_codes = decode_qr(img)
             ten_khach = "Không tìm thấy mã QR trên trang"
             tien_con = "0 đ"
@@ -99,7 +99,7 @@ async def process_pdf(file: UploadFile = File(...)):
             if qr_codes:
                 qr_data = qr_codes[0].data.decode('utf-8').strip()
                 try:
-                    # Truy vấn bảng _A2 với điều kiện "STT" khớp mã QR và lấy cột "Họ và tên"
+                    # Truy vấn đích xác: Lọc theo STT và lấy đúng cột "Họ và tên"
                     sql_a2 = text('SELECT "Họ và tên", "Số tiền" FROM "_A2" WHERE "STT"::text = :stt LIMIT 1;')
                     a2_result = db.execute(sql_a2, {"stt": qr_data}).fetchone()
                     
@@ -113,28 +113,9 @@ async def process_pdf(file: UploadFile = File(...)):
                         ten_khach = f"Mã QR [{qr_data}] không tồn tại trong bảng _A2"
                 except Exception as db_err:
                     db.rollback() 
-                    try:
-                        sql_fallback = text('SELECT * FROM "_A2" WHERE "STT"::text = :stt LIMIT 1;')
-                        row_fb = db.execute(sql_fallback, {"stt": qr_data}).fetchone()
-                        if row_fb:
-                            row_dict = row_fb._asdict()
-                            name_val = None
-                            money_val = None
-                            for k, v in row_dict.items():
-                                k_l = k.lower()
-                                if "tên" in k_l or "ten" in k_l:
-                                    name_val = v
-                                if "tiền" in k_l or "tien" in k_l or "con" in k_l or "sodu" in k_l:
-                                    money_val = v
-                            ten_khach = str(name_val or f"STT: {qr_data}")
-                            tien_con = str(money_val or "0") + " đ"
-                        else:
-                            ten_khach = f"Mã QR [{qr_data}] không tìm thấy trong _A2"
-                    except Exception as e2:
-                        db.rollback()
-                        err_str = str(e2)
-                        print(f"LỖI TRUY VẤN _A2: {err_str}")
-                        ten_khach = f"Lỗi ánh xạ STT: {err_str[:40]}"
+                    err_str = str(db_err)
+                    print(f"LỖI TRUY VẤN BẢNG _A2 cho STT [{qr_data}]: {err_str}")
+                    ten_khach = f"Lỗi DB _A2: {err_str[:40]}"
 
             ocr_database[page_num + 1] = {
                 "ten": ten_khach,
