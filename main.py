@@ -13,7 +13,7 @@ from sqlalchemy.orm import sessionmaker
 # --- CẤU HÌNH KẾT NỐI POSTGRESQL ---
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
-    DATABASE_URL = "postgresql://postgres:password@localhost:5432/ocr_db"
+    DATABASE_URL = "postgresql://postgres:ALTcgCCqAIjJCAwtcSVOFqdsBbNoBzyq@postgres.railway.internal:5432/railway"
 
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
@@ -86,7 +86,7 @@ async def process_pdf(file: UploadFile = File(...)):
             img_bytes = pix.tobytes("png")
             
             nparr = np.frombuffer(img_bytes, np.uint8)
-            img = cv2.imdecode(nparr, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
             
             if img is None:
                 continue
@@ -114,7 +114,6 @@ async def process_pdf(file: UploadFile = File(...)):
                 except Exception as db_err:
                     db.rollback() 
                     try:
-                        # Fallback nếu tên cột trong DB viết không dấu hoặc khác một chút
                         sql_fallback = text('SELECT * FROM "_A2" WHERE "STT"::text = :stt LIMIT 1;')
                         row_fb = db.execute(sql_fallback, {"stt": qr_data}).fetchone()
                         if row_fb:
