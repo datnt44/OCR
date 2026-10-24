@@ -1,9 +1,10 @@
 FROM python:3.11-slim
 
-# Cài đặt Tesseract OCR, gói ngôn ngữ tiếng Việt và các thư viện hệ thống cần thiết
+# Cài đặt Tesseract OCR, gói tiếng Việt, thư viện ZBar (để đọc QR) và các gói hệ thống
 RUN apt-get update && apt-get install -y \
     tesseract-ocr \
     tesseract-ocr-vie \
+    libzbar0 \
     libgl1-mesa-glx \
     libglib2.0-0 \
     libpq-dev \
