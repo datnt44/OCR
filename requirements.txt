@@ -5,6 +5,5 @@ pymupdf
 pytesseract
 opencv-python-headless
 numpy
-psycopg
 psycopg2-binary
 sqlalchemy
