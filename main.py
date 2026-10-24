@@ -78,7 +78,7 @@ async def process_pdf(file: UploadFile = File(...)):
             if img is None:
                 continue
 
-            # 2. ĐỌC MÃ QR CODE (TÌM THÔNG TIN TỪ BẢNG "_A2" THEO "STT")
+           # 2. ĐỌC MÃ QR CODE (TÌM THÔNG TIN TỪ BẢNG "_A2" THEO "STT")
             qr_codes = decode_qr(img)
             ten_khach = "Không tìm thấy mã QR trên trang"
             tien_con = "0 đ"
@@ -86,29 +86,37 @@ async def process_pdf(file: UploadFile = File(...)):
             if qr_codes:
                 qr_data = qr_codes[0].data.decode('utf-8').strip()
                 try:
-                    sql_a2 = text('SELECT * FROM "_A2" WHERE "STT" = :stt LIMIT 1;')
+                    # Thử truy vấn linh hoạt (hỗ trợ cả trường hợp STT là số hoặc chuỗi)
+                    sql_a2 = text('SELECT * FROM "_A2" WHERE "STT"::text = :stt LIMIT 1;')
                     a2_result = db.execute(sql_a2, {"stt": qr_data}).fetchone()
                     
                     if a2_result:
-                        # Chuyển kết quả sang dạng dict để dễ bóc tách tên cột không phân biệt hoa thường
                         row_dict = a2_result._asdict()
-                        # Tìm kiếm linh hoạt các cột tên khách hàng / số tiền trong bảng _A2
                         found_name = None
                         found_money = None
+                        
+                        # Tự động quét các cột chứa tên hoặc tiền trong bảng _A2
                         for k, v in row_dict.items():
                             k_lower = k.lower()
-                            if any(w in k_lower for w in ["ten", "họ tên", "hoten", "phamnhan"]):
+                            if any(w in k_lower for w in ["ten", "họ tên", "hoten", "phamnhan", "ho_ten"]):
                                 found_name = v
-                            if any(w in k_lower for w in ["tien", "số tiền", "sotien", "con"]):
+                            if any(w in k_lower for w in ["tien", "số tiền", "sotien", "con", "so_du"]):
                                 found_money = v
                         
-                        ten_khach = str(found_name or f"STT: {qr_data} (Thiếu cột tên)")
+                        # Nếu không tìm thấy qua từ khóa, lấy mặc định cột thứ 2 hoặc thứ 3 trong bảng
+                        if not found_name and len(row_dict) > 1:
+                            found_name = list(row_dict.values())[1]
+                        if not found_money and len(row_dict) > 2:
+                            found_money = list(row_dict.values())[2]
+
+                        ten_khach = str(found_name or f"STT: {qr_data}")
                         tien_con = str(found_money or "0") + " đ"
                     else:
-                        ten_khach = f"Mã QR [{qr_data}] không có trong bảng _A2"
+                        ten_khach = f"Mã QR [{qr_data}] không tồn tại trong bảng _A2"
                 except Exception as db_err:
-                    print(f"Lỗi truy vấn bảng _A2: {str(db_err)}")
-                    ten_khach = f"Mã QR [{qr_data}] (Lỗi SQL _A2)"
+                    # In chi tiết lỗi SQL ra Terminal của Railway để debug
+                    print(f"CHI TIẾT LỖI SQL _A2 cho mã {qr_data}: {str(db_err)}")
+                    ten_khach = f"Lỗi SQL _A2: {str(db_err)[:40]}"
 
             # Gán danh mục hàng hóa vào từng trang
             ocr_database[page_num + 1] = {
