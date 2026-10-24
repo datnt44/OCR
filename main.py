@@ -94,21 +94,18 @@ async def process_pdf(file: UploadFile = File(...)):
             # ĐỌC MÃ QR CODE (CHÍNH LÀ CỘT "STT" TRONG BẢNG _A2)
             qr_codes = decode_qr(img)
             ten_khach = "Không tìm thấy mã QR trên trang"
-            tien_con = "0 đ"
             
             if qr_codes:
                 qr_data = qr_codes[0].data.decode('utf-8').strip()
                 try:
-                    # Truy vấn đích xác: Lọc theo STT và lấy đúng cột "Họ và tên"
-                    sql_a2 = text('SELECT "Họ và tên", "Số tiền" FROM "_A2" WHERE "STT"::text = :stt LIMIT 1;')
+                    # Truy vấn đích xác: Lọc theo STT và chỉ lấy duy nhất cột "Họ và tên"
+                    sql_a2 = text('SELECT "Họ et tên" FROM "_A2" WHERE "STT"::text = :stt LIMIT 1;'.replace('et ', '')) # Đảm bảo viết đúng "Họ và tên"
+                    # Hoặc viết trực tiếp chuẩn xác:
+                    sql_a2 = text('SELECT "Họ và tên" FROM "_A2" WHERE "STT"::text = :stt LIMIT 1;')
                     a2_result = db.execute(sql_a2, {"stt": qr_data}).fetchone()
                     
-                    if a2_result:
-                        ho_ten = a2_result[0]
-                        so_tien = a2_result[1] if len(a2_result) > 1 else 0
-                        
-                        ten_khach = str(ho_ten or f"STT: {qr_data} (Tên trống)")
-                        tien_con = str(so_tien or "0") + " đ"
+                    if a2_result and a2_result[0]:
+                        ten_khach = str(a2_result[0])
                     else:
                         ten_khach = f"Mã QR [{qr_data}] không tồn tại trong bảng _A2"
                 except Exception as db_err:
@@ -119,7 +116,7 @@ async def process_pdf(file: UploadFile = File(...)):
 
             ocr_database[page_num + 1] = {
                 "ten": ten_khach,
-                "tienCon": tien_con,
+                "tienCon": "0 đ",  # Mặc định luôn là 0đ theo yêu cầu không quan tâm số tiền
                 "items": master_items
             }
 
