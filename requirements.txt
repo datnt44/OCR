@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+python-multipart
+PyMuPDF
+pytesseract
+opencv-python-headless
+numpy
+psycopg2-binary
+sqlalchemy
