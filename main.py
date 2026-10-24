@@ -2,6 +2,18 @@ import os
 import traceback
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+
+app = FastAPI()
+
+# Cấu hình CORS chuẩn để chấp nhận mọi request từ Netlify (bao gồm cả Preflight OPTIONS)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Cho phép tất cả các nguồn gọi vào
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+)
+
 from pydantic import BaseModel
 import pymupdf as fitz  # PyMuPDF chuẩn
 import pytesseract
