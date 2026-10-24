@@ -1,2 +1,2 @@
 [phases.setup]
-nixPkgs = ["python3", "tesseract-ocr", "tesseract-ocr-vie", "libgl1", "libglib2.0-0"]
+nixPkgs = ["python3", "tesseract-ocr", "tesseract-ocr-vie", "libgl1", "libglib2.0-0", "postgresql"]
