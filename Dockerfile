@@ -1,11 +1,11 @@
 FROM python:3.11-slim
 
-# Cài đặt Tesseract OCR, gói tiếng Việt, thư viện ZBar, OpenCV system dependencies và PostgreSQL dev libraries
+# Cài đặt Tesseract OCR, ZBar, và thư viện đồ họa cập nhật (libgl1 thay thế libgl1-mesa-glx)
 RUN apt-get update && apt-get install -y \
     tesseract-ocr \
     tesseract-ocr-vie \
     libzbar0 \
-    libgl1-mesa-glx \
+    libgl1 \
     libglib2.0-0 \
     libpq-dev \
     gcc \
