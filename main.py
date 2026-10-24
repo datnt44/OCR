@@ -4,7 +4,6 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pymupdf as fitz
-import pytesseract
 import cv2
 import numpy as np
 from pyzbar.pyzbar import decode as decode_qr
@@ -36,7 +35,7 @@ app.add_middleware(
 
 @app.get("/")
 def read_root():
-    return {"status": "online", "message": "OCR & Database Integration API is running!"}
+    return {"status": "online", "message": "API is running successfully!"}
 
 @app.post("/api/process-pdf")
 async def process_pdf(file: UploadFile = File(...)):
@@ -45,6 +44,28 @@ async def process_pdf(file: UploadFile = File(...)):
         contents = await file.read()
         doc = fitz.open(stream=contents, filetype="pdf")
         ocr_database = {}
+
+        # 1. TẢI TRƯỚC TOÀN BỘ DANH MỤC HÀNG HÓA TỪ BẢNG "danh muc hang trai 2"
+        master_items = []
+        try:
+            sql_items = text('SELECT "Mã hàng", "Tên hàng", "Đơn vị tính" FROM "danh muc hang trai 2";')
+            result_items = db.execute(sql_items).fetchall()
+            for row in result_items:
+                master_items.append({
+                    "ma": str(row[0] or ""),
+                    "ten": str(row[1] or ""),
+                    "dvt": str(row[2] or ""),
+                    "sl": 0,
+                    "trangThai": "Khớp DB"
+                })
+        except Exception as e:
+            print(f"Lỗi đọc bảng 'danh muc hang trai 2': {str(e)}")
+
+        # Nếu bảng danh mục trống, dùng dữ liệu mẫu để giao diện không bị trắng
+        if not master_items:
+            master_items = [
+                {"ma": "ERR", "ten": "Không thể đọc dữ liệu từ bảng 'danh muc hang trai 2'", "dvt": "--", "sl": 0, "trangThai": "Lỗi DB"}
+            ]
 
         for page_num in range(len(doc)):
             page = doc[page_num]
@@ -57,58 +78,43 @@ async def process_pdf(file: UploadFile = File(...)):
             if img is None:
                 continue
 
-            # --- 1. ĐỌC MÃ QR CODE (CHÍNH LÀ CỘT "STT" TRONG BẢNG _A2) ---
+            # 2. ĐỌC MÃ QR CODE (TÌM THÔNG TIN TỪ BẢNG "_A2" THEO "STT")
             qr_codes = decode_qr(img)
-            buyer_info = {"ten": "Không quét được mã QR", "tienCon": "0 đ"}
+            ten_khach = "Không tìm thấy mã QR trên trang"
+            tien_con = "0 đ"
             
             if qr_codes:
                 qr_data = qr_codes[0].data.decode('utf-8').strip()
                 try:
-                    # Truy vấn bảng _A2 với khóa chính là cột "STT"
-                    # Lưu ý: Bọc tên cột bằng dấu ngoặc kép hoặc đổi tên chữ hoa/thường tùy theo định nghĩa trong DB
                     sql_a2 = text('SELECT * FROM "_A2" WHERE "STT" = :stt LIMIT 1;')
-                    result = db.execute(sql_a2, {"stt": qr_data}).fetchone()
+                    a2_result = db.execute(sql_a2, {"stt": qr_data}).fetchone()
                     
-                    if result:
-                        # Lấy thông tin người mua (điều chỉnh tên cột sao cho khớp với bảng _A2 của bạn, ví dụ: "ho_ten", "ten_pham_nhan"...)
-                        # Dưới đây tạm lấy các cột phổ biến hoặc trả về dạng đối tượng
-                        ten_khach = getattr(result, "ten_pham_nhan", getattr(result, "HoTen", f"STT: {qr_data}"))
-                        tien_con = getattr(result, "so_tien_con", getattr(result, "TienCon", "0"))
+                    if a2_result:
+                        # Chuyển kết quả sang dạng dict để dễ bóc tách tên cột không phân biệt hoa thường
+                        row_dict = a2_result._asdict()
+                        # Tìm kiếm linh hoạt các cột tên khách hàng / số tiền trong bảng _A2
+                        found_name = None
+                        found_money = None
+                        for k, v in row_dict.items():
+                            k_lower = k.lower()
+                            if any(w in k_lower for w in ["ten", "họ tên", "hoten", "phamnhan"]):
+                                found_name = v
+                            if any(w in k_lower for w in ["tien", "số tiền", "sotien", "con"]):
+                                found_money = v
                         
-                        buyer_info["ten"] = str(ten_khach)
-                        buyer_info["tienCon"] = str(tien_con) + " đ"
+                        ten_khach = str(found_name or f"STT: {qr_data} (Thiếu cột tên)")
+                        tien_con = str(found_money or "0") + " đ"
                     else:
-                        buyer_info["ten"] = f"Mã QR [{qr_data}] không tồn tại trong bảng _A2"
+                        ten_khach = f"Mã QR [{qr_data}] không có trong bảng _A2"
                 except Exception as db_err:
                     print(f"Lỗi truy vấn bảng _A2: {str(db_err)}")
-                    buyer_info["ten"] = f"Mã QR [{qr_data}] (Lỗi kết nối DB _A2)"
+                    ten_khach = f"Mã QR [{qr_data}] (Lỗi SQL _A2)"
 
-            # --- 2. LẤY DỮ LIỆU TỪ BẢNG "danh muc hang trai 2" ---
-            page_items = []
-            try:
-                # Truy vấn lấy Mã hàng, Tên hàng, Đơn vị tính từ bảng danh mục
-                sql_items = text('SELECT "Mã hàng", "Tên hàng", "Đơn vị tính" FROM "danh muc hang trai 2";')
-                items_result = db.execute(sql_items).fetchall()
-                
-                if items_result:
-                    for row in items_result:
-                        page_items.append({
-                            "ma": row[0],         # "Mã hàng"
-                            "ten": row[1],        # "Tên hàng"
-                            "dvt": row[2],        # "Đơn vị tính"
-                            "sl": 0,              # Số lượng mặc định để rà soát
-                            "trangThai": "Đã lấy từ danh mục"
-                        })
-                else:
-                    page_items = [{"ma": "TRONG", "ten": "Bảng danh mục trống", "dvt": "--", "sl": 0, "trangThai": "Cảnh báo"}]
-            except Exception as e:
-                print(f"Lỗi lấy bảng danh mục hàng hóa: {str(e)}")
-                page_items = [{"ma": "ERR", "ten": "Lỗi kết nối bảng danh muc hang trai 2", "dvt": "--", "sl": 0, "trangThai": "Lỗi DB"}]
-
+            # Gán danh mục hàng hóa vào từng trang
             ocr_database[page_num + 1] = {
-                "ten": buyer_info["ten"],
-                "tienCon": buyer_info["tienCon"],
-                "items": page_items
+                "ten": ten_khach,
+                "tienCon": tien_con,
+                "items": master_items
             }
 
         return {"total_pages": len(doc), "data": ocr_database}
@@ -129,7 +135,6 @@ class PageDataModel(BaseModel):
 async def save_page(data: PageDataModel):
     db = SessionLocal()
     try:
-        # Xóa dữ liệu cũ của trang trước khi lưu mới
         db.execute(text("DELETE FROM phieu_mua_hang WHERE page = :page"), {"page": data.page})
         
         for item in data.items:
@@ -149,14 +154,9 @@ async def save_page(data: PageDataModel):
             })
             
         db.commit()
-        return {"status": "success", "message": f"Đã lưu thành công dữ liệu trang {data.page} vào cơ sở dữ liệu!"}
+        return {"status": "success", "message": f"Đã lưu thành công dữ liệu trang {data.page}!"}
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         db.close()
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port)
