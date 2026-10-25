@@ -270,11 +270,58 @@ def extract_table_rows(img: np.ndarray):
 # ======================================================================
 # TRUY VẤN DATABASE
 # ======================================================================
+MASTER_TABLE = "danh muc hang trai 2"
+
+
+def _find_column(columns: list, *candidates: str):
+    """Tìm tên cột thật, bỏ qua dấu / hoa thường / khoảng trắng."""
+    def key(s: str) -> str:
+        return strip_accents(s).replace(" ", "").replace("_", "")
+
+    wanted = {key(c) for c in candidates}
+    for col in columns:
+        if key(col) in wanted:
+            return col
+    return None
+
+
+def _quote(ident: str) -> str:
+    return '"' + ident.replace('"', '""') + '"'
+
+
 def load_master_items(db) -> list:
     try:
+        columns = [
+            r[0]
+            for r in db.execute(
+                text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = :t ORDER BY ordinal_position"
+                ),
+                {"t": MASTER_TABLE},
+            ).fetchall()
+        ]
+        log.info("Các cột trong bảng %s: %s", MASTER_TABLE, columns)
+
+        col_ma = _find_column(columns, "Mã hàng", "Mã số hàng", "Mã")
+        col_ten = _find_column(columns, "Tên hàng", "Tên hàng hóa", "Tên")
+        col_dvt = _find_column(columns, "Đơn vị tính", "Đơn vị", "ĐVT", "DVT")
+
+        if not columns or not col_ma or not col_ten:
+            log.error("Bảng %s thiếu cột Mã hàng / Tên hàng. Cột hiện có: %s", MASTER_TABLE, columns)
+            raise HTTPException(
+                status_code=500,
+                detail="Bảng danh mục không có cột Mã hàng hoặc Tên hàng (xem log máy chủ)",
+            )
+        if not col_dvt:
+            log.warning("Bảng %s không có cột đơn vị tính, sẽ để trống.", MASTER_TABLE)
+
+        dvt_sql = _quote(col_dvt) if col_dvt else "''"
         rows = db.execute(
-            text('SELECT "Mã hàng", "Tên hàng", "Đơn vị tính" FROM "danh muc hang trai 2";')
+            text(f"SELECT {_quote(col_ma)}, {_quote(col_ten)}, {dvt_sql} FROM {_quote(MASTER_TABLE)}")
         ).fetchall()
+    except HTTPException:
+        raise
     except Exception:
         db.rollback()
         log.error("Lỗi đọc bảng danh mục:\n%s", traceback.format_exc())
