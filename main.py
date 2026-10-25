@@ -3,10 +3,15 @@ import difflib
 import logging
 import os
 import re
+import threading
+import time
 import traceback
 import unicodedata
 import uuid
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from typing import List
+from zoneinfo import ZoneInfo
 
 import cv2
 import numpy as np
@@ -42,6 +47,12 @@ PDF_DPI = int(os.environ.get("PDF_DPI", "200"))          # độ phân giải re
 QR_FALLBACK_DPI = int(os.environ.get("QR_FALLBACK_DPI", "300"))
 MAX_PDF_MB = int(os.environ.get("MAX_PDF_MB", "30"))
 OCR_LANG_WANTED = os.environ.get("OCR_LANG", "vie+eng")
+MAX_BATCHES = int(os.environ.get("MAX_BATCHES", "20"))   # số lô PDF giữ trong bộ nhớ
+
+try:
+    VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
+except Exception:  # máy chủ thiếu dữ liệu múi giờ
+    VN_TZ = timezone(timedelta(hours=7))
 
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -80,21 +91,64 @@ OCR_LANG = _pick_ocr_lang()
 log.info("Ngôn ngữ OCR: %s", OCR_LANG)
 
 
+# Bảng cha: phieu_chi (mỗi trang phiếu = 1 dòng). Bảng con: phieu_chi_ct (chi tiết mặt hàng).
+SCHEMA_STATEMENTS = [
+    "ALTER TABLE phieu_mua_hang ADD COLUMN IF NOT EXISTS batch_id TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_phieu_batch_page ON phieu_mua_hang (batch_id, page)",
+    """
+    CREATE TABLE IF NOT EXISTS phieu_chi (
+        id BIGSERIAL PRIMARY KEY,
+        batch_id TEXT NOT NULL,
+        page INTEGER NOT NULL,
+        loai TEXT NOT NULL DEFAULT 'Chi',
+        stt TEXT NOT NULL,
+        ngay DATE NOT NULL,
+        ho_ten TEXT,
+        ngay_sinh TEXT,
+        gioi_tinh TEXT,
+        noi_tt TEXT,
+        hanh_vi TEXT,
+        ngay_bat TEXT,
+        buong_giam TEXT,
+        tgiam TEXT,
+        tong_so_luong INTEGER NOT NULL DEFAULT 0,
+        so_tien BIGINT NOT NULL DEFAULT 0,
+        so_tien_bang_chu TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        UNIQUE (batch_id, page)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS phieu_chi_ct (
+        id BIGSERIAL PRIMARY KEY,
+        phieu_id BIGINT NOT NULL REFERENCES phieu_chi(id) ON DELETE CASCADE,
+        ma_hang TEXT NOT NULL,
+        ten_hang TEXT,
+        dvt TEXT,
+        so_luong INTEGER NOT NULL,
+        gia BIGINT NOT NULL,
+        thanh_tien BIGINT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_phieu_chi_ct_phieu ON phieu_chi_ct (phieu_id)",
+    "CREATE INDEX IF NOT EXISTS idx_phieu_chi_stt_ngay ON phieu_chi (stt, ngay)",
+]
+
+
 @app.on_event("startup")
 def ensure_schema():
-    """Thêm cột batch_id vào bảng phieu_mua_hang nếu chưa có."""
-    db = SessionLocal()
-    try:
-        db.execute(text("ALTER TABLE phieu_mua_hang ADD COLUMN IF NOT EXISTS batch_id TEXT"))
-        db.execute(text(
-            "CREATE INDEX IF NOT EXISTS idx_phieu_batch_page ON phieu_mua_hang (batch_id, page)"
-        ))
-        db.commit()
-    except Exception:
-        db.rollback()
-        log.warning("Không thể cập nhật schema phieu_mua_hang:\n%s", traceback.format_exc())
-    finally:
-        db.close()
+    """Tạo bảng phieu_chi / phieu_chi_ct nếu chưa có. Mỗi lệnh chạy riêng để một lệnh lỗi không chặn các lệnh khác."""
+    for stmt in SCHEMA_STATEMENTS:
+        db = SessionLocal()
+        try:
+            db.execute(text(stmt))
+            db.commit()
+        except Exception:
+            db.rollback()
+            log.warning("Lệnh schema lỗi (bỏ qua): %s\n%s", " ".join(stmt.split())[:70], traceback.format_exc())
+        finally:
+            db.close()
 
 
 # ======================================================================
@@ -141,6 +195,31 @@ def render_page(page, dpi: int) -> np.ndarray | None:
 # ======================================================================
 # OCR BẢNG: tìm cột "Mã hàng" và "Số lượng"
 # ======================================================================
+def remove_table_lines(gray: np.ndarray) -> np.ndarray:
+    """Xóa đường kẻ ngang/dọc của bảng (Tesseract thường bỏ qua cả bảng nếu còn đường kẻ).
+    Trả về ảnh xám nền trắng, chữ đen."""
+    ink = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+    h, w = ink.shape[:2]
+    horiz = cv2.morphologyEx(
+        ink, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (max(w // 30, 40), 1))
+    )
+    vert = cv2.morphologyEx(
+        ink, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(h // 40, 40)))
+    )
+    lines = cv2.dilate(cv2.bitwise_or(horiz, vert), np.ones((3, 3), np.uint8), iterations=1)
+    cleaned = ink.copy()
+    cleaned[lines > 0] = 0
+    return 255 - cleaned
+
+
+# OCR hay đọc chữ cái thành chữ số/ký hiệu (Số -> S6, Mã -> M&); đưa về chữ cái để so tiêu đề.
+_HDR_FIX = str.maketrans({"0": "o", "6": "o", "1": "l", "5": "s", "8": "b", "3": "e", "&": "a", "@": "a"})
+
+
+def header_norm(s: str) -> str:
+    return re.sub(r"[^a-z]", "", strip_accents(s).translate(_HDR_FIX))
+
+
 def ocr_words(img: np.ndarray) -> list:
     data = pytesseract.image_to_data(
         img, lang=OCR_LANG, config="--psm 6", output_type=pytesseract.Output.DICT
@@ -158,7 +237,7 @@ def ocr_words(img: np.ndarray) -> list:
             continue
         x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
         words.append({
-            "text": t, "n": strip_accents(t),
+            "text": t, "n": header_norm(t),
             "x": x, "y": y, "w": w, "h": h,
             "cx": x + w / 2, "cy": y + h / 2,
         })
@@ -168,6 +247,12 @@ def ocr_words(img: np.ndarray) -> list:
 def find_header_pair(words: list, first: str, second: str):
     """Tìm cặp từ liền nhau trên cùng một dòng, ví dụ ('ma','hang') hoặc ('so','luong')."""
     best = None
+    # Trường hợp OCR dính hai chữ thành một từ ("Mã hàng" -> "Mahang")
+    merged = first + second
+    for a in words:
+        if len(a["n"]) >= len(merged) - 1 and sim(a["n"], merged) >= 0.8:
+            if best is None or a["cy"] < best[0]["cy"]:
+                best = (a, a)
     for a in words:
         if sim(a["n"], first) < 0.75:
             continue
@@ -206,7 +291,7 @@ def read_digits(img: np.ndarray, x0: int, x1: int, y0: int, y1: int) -> str:
     crop = img[y0:y1, x0:x1]
     if crop.size == 0:
         return ""
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    gray = crop if crop.ndim == 2 else cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     gray = cv2.copyMakeBorder(gray, 10, 10, 10, 10, cv2.BORDER_CONSTANT, value=255)
     bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
     cfg = "--psm 7 -c tessedit_char_whitelist=0123456789"
@@ -217,6 +302,7 @@ def read_digits(img: np.ndarray, x0: int, x1: int, y0: int, y1: int) -> str:
 def extract_table_rows(img: np.ndarray):
     """Trả về (danh sách (mã hàng, số lượng), danh sách cảnh báo)."""
     warnings = []
+    img = remove_table_lines(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))  # ảnh xám đã xóa đường kẻ
     words = ocr_words(img)
     ma_pair = find_header_pair(words, "ma", "hang")
     sl_pair = find_header_pair(words, "so", "luong")
@@ -289,6 +375,92 @@ def _quote(ident: str) -> str:
     return '"' + ident.replace('"', '""') + '"'
 
 
+def parse_money(v) -> int:
+    if v is None:
+        return 0
+    if isinstance(v, float) and v != v:  # NaN
+        return 0
+    if isinstance(v, (int, float, Decimal)):
+        return int(round(v))
+    digits = re.sub(r"[^0-9]", "", str(v))
+    return int(digits) if digits else 0
+
+
+def fmt_value(v) -> str:
+    """Chuẩn hóa giá trị cột thành chuỗi; ngày -> dd/mm/yyyy."""
+    if v is None:
+        return ""
+    if isinstance(v, date):  # gồm cả datetime
+        return v.strftime("%d/%m/%Y")
+    s = str(v).strip()
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", s)
+    if m:
+        return f"{m.group(3)}/{m.group(2)}/{m.group(1)}"
+    return s
+
+
+def get_columns(db, table: str) -> list:
+    rows = db.execute(
+        text(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = :t ORDER BY ordinal_position"
+        ),
+        {"t": table},
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def natural_key(s: str) -> list:
+    """Sắp xếp tự nhiên: A1, A2, A10, B1..."""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
+
+
+_DIGITS = ["không", "một", "hai", "ba", "bốn", "năm", "sáu", "bảy", "tám", "chín"]
+
+
+def _read_triple(n: int, full: bool) -> str:
+    tr, ch, dv = n // 100, (n % 100) // 10, n % 10
+    parts = []
+    if tr > 0 or full:
+        parts.append(_DIGITS[tr] + " trăm")
+    if ch > 1:
+        parts.append(_DIGITS[ch] + " mươi")
+    elif ch == 1:
+        parts.append("mười")
+    elif dv > 0 and (tr > 0 or full):
+        parts.append("lẻ")
+    if dv > 0:
+        if dv == 1 and ch > 1:
+            parts.append("mốt")
+        elif dv == 5 and ch > 0:
+            parts.append("lăm")
+        else:
+            parts.append(_DIGITS[dv])
+    return " ".join(parts)
+
+
+def money_to_words(amount: int) -> str:
+    if amount <= 0:
+        return "Không đồng"
+    if amount >= 10**12:
+        return f"{amount} đồng"
+    units = ["", "nghìn", "triệu", "tỷ"]
+    chunks, n = [], amount
+    while n > 0:
+        chunks.append(n % 1000)
+        n //= 1000
+    top = len(chunks) - 1
+    out = []
+    for i in range(top, -1, -1):
+        if chunks[i] == 0:
+            continue
+        out.append(_read_triple(chunks[i], full=(i != top)))
+        if units[i]:
+            out.append(units[i])
+    s = " ".join(out)
+    return s[:1].upper() + s[1:] + " đồng"
+
+
 def load_master_items(db) -> list:
     try:
         columns = [
@@ -306,6 +478,8 @@ def load_master_items(db) -> list:
         col_ma = _find_column(columns, "Mã hàng", "Mã số hàng", "Mã")
         col_ten = _find_column(columns, "Tên hàng", "Tên hàng hóa", "Tên")
         col_dvt = _find_column(columns, "Đơn vị tính", "Đơn vị", "ĐVT", "DVT")
+        col_gia = _find_column(columns, "Giá bán", "Đơn giá", "Giá")
+        col_status = _find_column(columns, "status", "Trạng thái")
 
         if not columns or not col_ma or not col_ten:
             log.error("Bảng %s thiếu cột Mã hàng / Tên hàng. Cột hiện có: %s", MASTER_TABLE, columns)
@@ -316,9 +490,17 @@ def load_master_items(db) -> list:
         if not col_dvt:
             log.warning("Bảng %s không có cột đơn vị tính, sẽ để trống.", MASTER_TABLE)
 
+        if not col_gia:
+            log.warning("Bảng %s không có cột Giá bán, giá sẽ là 0.", MASTER_TABLE)
+
         dvt_sql = _quote(col_dvt) if col_dvt else "''"
+        gia_sql = _quote(col_gia) if col_gia else "NULL"
+        status_sql = _quote(col_status) if col_status else "'on'"
         rows = db.execute(
-            text(f"SELECT {_quote(col_ma)}, {_quote(col_ten)}, {dvt_sql} FROM {_quote(MASTER_TABLE)}")
+            text(
+                f"SELECT {_quote(col_ma)}, {_quote(col_ten)}, {dvt_sql}, {gia_sql}, {status_sql} "
+                f"FROM {_quote(MASTER_TABLE)}"
+            )
         ).fetchall()
     except HTTPException:
         raise
@@ -328,9 +510,11 @@ def load_master_items(db) -> list:
         raise HTTPException(status_code=500, detail="Không đọc được bảng danh mục hàng hóa")
     return [
         {
-            "ma": str(r[0] or ""),
-            "ten": str(r[1] or ""),
-            "dvt": str(r[2] or ""),
+            "ma": str(r[0] or "").strip(),
+            "ten": str(r[1] or "").strip(),
+            "dvt": str(r[2] or "").strip(),
+            "gia": parse_money(r[3]),
+            "on": str(r[4] or "").strip().lower() == "on",
             "sl": 0,
             "trangThai": "Chưa đọc được",
         }
@@ -338,19 +522,60 @@ def load_master_items(db) -> list:
     ]
 
 
-def lookup_customer(db, stt: str) -> str:
-    try:
-        row = db.execute(
-            text('SELECT "Họ và tên" FROM "_A2" WHERE "STT"::text = :stt LIMIT 1;'),
-            {"stt": stt},
-        ).fetchone()
-    except Exception:
-        db.rollback()
-        log.error("Lỗi truy vấn _A2 (STT=%s):\n%s", stt, traceback.format_exc())
-        return "Lỗi truy vấn bảng _A2"
-    if row and row[0]:
-        return str(row[0])
-    return f"Mã QR [{stt}] không tồn tại trong bảng _A2"
+# Thông tin can phạm trong bảng _A2 (key trả về cho frontend -> các tên cột có thể gặp)
+PERSON_FIELDS = {
+    "hoTen": ("Họ và tên", "Họ tên"),
+    "ngaySinh": ("Ngày sinh",),
+    "gioiTinh": ("Giới tính",),
+    "noiTT": ("Nơi TT", "Nơi thường trú"),
+    "hanhVi": ("Hành vi",),
+    "ngayBat": ("Ngày bắt",),
+    "buongGiam": ("Buồng giam", "Buồng"),
+    "tGiam": ("TGiam", "Tạm giam"),
+}
+_PERSON_COLS = {"at": 0.0, "value": None}
+_PERSON_COLS_LOCK = threading.Lock()
+
+
+def person_columns(db):
+    """(tên cột STT, {key: tên cột thật}) của bảng _A2, lưu tạm 5 phút."""
+    with _PERSON_COLS_LOCK:
+        if _PERSON_COLS["value"] and time.time() - _PERSON_COLS["at"] < 300:
+            return _PERSON_COLS["value"]
+    columns = get_columns(db, "_A2")
+    col_stt = _find_column(columns, "STT")
+    picked = {}
+    for key, names in PERSON_FIELDS.items():
+        col = _find_column(columns, *names)
+        if col:
+            picked[key] = col
+    if not col_stt or "hoTen" not in picked:
+        log.error("Bảng _A2 thiếu cột STT hoặc Họ và tên. Cột hiện có: %s", columns)
+        raise HTTPException(status_code=500, detail="Bảng _A2 thiếu cột STT hoặc Họ và tên (xem log máy chủ)")
+    missing = [k for k in PERSON_FIELDS if k not in picked]
+    if missing:
+        log.warning("Bảng _A2 không có các cột: %s (sẽ để trống)", missing)
+    value = (col_stt, picked)
+    with _PERSON_COLS_LOCK:
+        _PERSON_COLS["at"] = time.time()
+        _PERSON_COLS["value"] = value
+    return value
+
+
+def fetch_person(db, stt: str):
+    """Trả về dict thông tin can phạm theo STT, hoặc None nếu không có."""
+    col_stt, picked = person_columns(db)
+    select_cols = ", ".join(_quote(c) for c in picked.values())
+    row = db.execute(
+        text(f'SELECT {select_cols} FROM "_A2" WHERE {_quote(col_stt)}::text = :stt LIMIT 1'),
+        {"stt": stt},
+    ).fetchone()
+    if row is None:
+        return None
+    person = {k: "" for k in PERSON_FIELDS}
+    for key, value in zip(picked.keys(), row):
+        person[key] = fmt_value(value)
+    return person
 
 
 # Các ký tự OCR hay nhầm với chữ số, dùng khi so khớp mã hàng
@@ -389,13 +614,13 @@ def merge_ocr_into_items(master_items: list, ocr_rows: list) -> list:
                 seen[uid]["sl"] += qty
                 continue
             row = {"ma": master["ma"], "ten": master["ten"], "dvt": master["dvt"],
-                   "sl": qty, "trangThai": status, "maOcr": code}
+                   "gia": master["gia"], "sl": qty, "trangThai": status, "maOcr": code}
         else:
             uid = "?" + key
             if uid in seen:
                 seen[uid]["sl"] += qty
                 continue
-            row = {"ma": code, "ten": "", "dvt": "", "sl": qty,
+            row = {"ma": code, "ten": "", "dvt": "", "gia": 0, "sl": qty,
                    "trangThai": "Không có trong DB", "maOcr": code}
         seen[uid] = row
         items.append(row)
@@ -410,71 +635,112 @@ def read_root():
     return {"status": "online", "message": "FastAPI PDF & Database Backend is running successfully!"}
 
 
+def analyze_page(page, master_items: list, db, person_cache: dict) -> dict:
+    """Đọc QR (-> STT -> thông tin can phạm) và OCR bảng hàng của một trang PDF."""
+    warnings = []
+
+    img = render_page(page, PDF_DPI)
+    if img is None:
+        return {
+            "qr": None, "ten": "Không đọc được trang", "nguoi": None, "tienCon": "0 đ",
+            "items": [], "canhBao": ["Không render được trang PDF"],
+        }
+
+    # --- QR code (chính là cột "STT" của bảng _A2) ---
+    qr_data = read_qr(img)
+    if not qr_data and QR_FALLBACK_DPI > PDF_DPI:
+        hi_img = render_page(page, QR_FALLBACK_DPI)
+        if hi_img is not None:
+            qr_data = read_qr(hi_img)
+
+    nguoi = None
+    if qr_data:
+        if qr_data not in person_cache:
+            try:
+                person_cache[qr_data] = fetch_person(db, qr_data)
+            except HTTPException:
+                raise
+            except Exception:
+                db.rollback()
+                log.error("Lỗi truy vấn _A2 (STT=%s):\n%s", qr_data, traceback.format_exc())
+                person_cache[qr_data] = False
+        cached = person_cache[qr_data]
+        if cached is False:
+            ten_khach = "Lỗi truy vấn bảng _A2"
+            warnings.append("Lỗi truy vấn bảng _A2")
+        elif cached is None:
+            ten_khach = f"Mã QR [{qr_data}] không tồn tại trong bảng _A2"
+            warnings.append(f"STT {qr_data} không có trong bảng _A2")
+        else:
+            nguoi = cached
+            ten_khach = cached["hoTen"]
+    else:
+        ten_khach = "Không tìm thấy mã QR trên trang"
+        warnings.append("Không đọc được QR")
+
+    # --- OCR Mã hàng + Số lượng ---
+    ocr_rows, ocr_warnings = extract_table_rows(img)
+    warnings.extend(ocr_warnings)
+    if not master_items:
+        warnings.append("Bảng danh mục hàng hóa đang trống")
+
+    return {
+        "qr": qr_data,
+        "ten": ten_khach,
+        "nguoi": nguoi,
+        "tienCon": "0 đ",
+        "items": merge_ocr_into_items(master_items, ocr_rows),
+        "canhBao": warnings,
+    }
+
+
+def analyze_pdf(contents: bytes, master_items: list, db, on_total=None, on_page=None) -> dict:
+    doc = fitz.open(stream=contents, filetype="pdf")
+    try:
+        total = len(doc)
+        if on_total:
+            on_total(total)
+        pages, person_cache = {}, {}
+        for i in range(total):
+            result = analyze_page(doc[i], master_items, db, person_cache)
+            pages[i + 1] = result
+            if on_page:
+                on_page(i + 1, result)
+        return pages
+    finally:
+        doc.close()
+
+
+def read_pdf_upload(file: UploadFile):
+    """Đọc file upload, kiểm tra dung lượng + định dạng. Trả về (bytes, số trang)."""
+    contents = file.file.read()
+    if len(contents) > MAX_PDF_MB * 1024 * 1024:
+        raise HTTPException(status_code=413, detail=f"File vượt quá {MAX_PDF_MB}MB")
+    try:
+        doc = fitz.open(stream=contents, filetype="pdf")
+        total = len(doc)
+        doc.close()
+    except Exception:
+        raise HTTPException(status_code=400, detail="File không phải PDF hợp lệ")
+    return contents, total
+
+
+# Chỉ cho một tiến trình OCR chạy tại một thời điểm để không hết RAM.
+OCR_SEMAPHORE = threading.Semaphore(1)
+
+
 # Dùng `def` (không phải `async def`): các tác vụ DB / OpenCV / OCR đều chặn luồng,
 # FastAPI sẽ tự chạy chúng trong thread pool thay vì làm nghẽn event loop.
 @app.post("/api/process-pdf")
 def process_pdf(file: UploadFile = File(...)):
-    contents = file.file.read()
-    if len(contents) > MAX_PDF_MB * 1024 * 1024:
-        raise HTTPException(status_code=413, detail=f"File vượt quá {MAX_PDF_MB}MB")
-
-    try:
-        doc = fitz.open(stream=contents, filetype="pdf")
-    except Exception:
-        raise HTTPException(status_code=400, detail="File không phải PDF hợp lệ")
-
+    """Bản đồng bộ (giữ để tương thích): xử lý cả PDF trong một request."""
+    contents, _total = read_pdf_upload(file)
     db = SessionLocal()
     try:
         master_items = load_master_items(db)
-        batch_id = uuid.uuid4().hex
-        ocr_database = {}
-        customer_cache = {}
-
-        for page_index in range(len(doc)):
-            page_no = page_index + 1
-            page = doc[page_index]
-            warnings = []
-
-            img = render_page(page, PDF_DPI)
-            if img is None:
-                ocr_database[page_no] = {
-                    "ten": "Không đọc được trang", "tienCon": "0 đ",
-                    "items": [],
-                    "canhBao": ["Không render được trang PDF"],
-                }
-                continue
-
-            # --- QR code (chính là cột "STT" của bảng _A2) ---
-            qr_data = read_qr(img)
-            if not qr_data and QR_FALLBACK_DPI > PDF_DPI:
-                hi_img = render_page(page, QR_FALLBACK_DPI)
-                if hi_img is not None:
-                    qr_data = read_qr(hi_img)
-
-            if qr_data:
-                if qr_data not in customer_cache:
-                    customer_cache[qr_data] = lookup_customer(db, qr_data)
-                ten_khach = customer_cache[qr_data]
-            else:
-                ten_khach = "Không tìm thấy mã QR trên trang"
-                warnings.append("Không đọc được QR")
-
-            # --- OCR Mã hàng + Số lượng ---
-            ocr_rows, ocr_warnings = extract_table_rows(img)
-            warnings.extend(ocr_warnings)
-            if not master_items:
-                warnings.append("Bảng danh mục hàng hóa đang trống")
-
-            ocr_database[page_no] = {
-                "qr": qr_data,
-                "ten": ten_khach,
-                "tienCon": "0 đ",
-                "items": merge_ocr_into_items(master_items, ocr_rows),
-                "canhBao": warnings,
-            }
-
-        return {"batch_id": batch_id, "total_pages": len(doc), "data": ocr_database}
-
+        with OCR_SEMAPHORE:
+            pages = analyze_pdf(contents, master_items, db)
+        return {"batch_id": uuid.uuid4().hex, "total_pages": len(pages), "data": pages}
     except HTTPException:
         raise
     except pytesseract.TesseractNotFoundError:
@@ -485,8 +751,79 @@ def process_pdf(file: UploadFile = File(...)):
         log.error("LỖI XỬ LÝ CHUNG:\n%s", traceback.format_exc())
         raise HTTPException(status_code=500, detail="Lỗi xử lý file PDF")
     finally:
-        doc.close()
         db.close()
+
+
+# ----------------------------------------------------------------------
+# Lô PDF xử lý nền: upload xong trả về ngay, frontend hỏi tiến độ theo từng trang.
+# Dữ liệu lô nằm trong bộ nhớ (mất khi server khởi động lại).
+# ----------------------------------------------------------------------
+BATCHES: dict = {}
+BATCHES_LOCK = threading.Lock()
+
+
+def _run_batch(batch_id: str, contents: bytes):
+    job = BATCHES.get(batch_id)
+    if job is None:
+        return
+    db = SessionLocal()
+    try:
+        with OCR_SEMAPHORE:
+            master_items = load_master_items(db)
+
+            def on_total(n):
+                job["total"] = n
+
+            def on_page(n, result):
+                with BATCHES_LOCK:
+                    job["pages"][n] = result
+                    job["done"] = len(job["pages"])
+
+            analyze_pdf(contents, master_items, db, on_total, on_page)
+        job["status"] = "done"
+    except HTTPException as e:
+        job["status"], job["error"] = "error", str(e.detail)
+    except pytesseract.TesseractNotFoundError:
+        log.error("Chưa cài Tesseract trên máy chủ")
+        job["status"], job["error"] = "error", "Máy chủ chưa cài Tesseract OCR"
+    except Exception:
+        db.rollback()
+        log.error("LỖI XỬ LÝ LÔ %s:\n%s", batch_id, traceback.format_exc())
+        job["status"], job["error"] = "error", "Lỗi xử lý file PDF"
+    finally:
+        db.close()
+
+
+@app.post("/api/batches")
+def create_batch(file: UploadFile = File(...)):
+    contents, total = read_pdf_upload(file)
+    batch_id = uuid.uuid4().hex
+    job = {"status": "running", "total": total, "done": 0, "error": None,
+           "pages": {}, "created": time.time()}
+    with BATCHES_LOCK:
+        BATCHES[batch_id] = job
+        while len(BATCHES) > MAX_BATCHES:
+            oldest = min(BATCHES, key=lambda k: BATCHES[k]["created"])
+            BATCHES.pop(oldest, None)
+    threading.Thread(target=_run_batch, args=(batch_id, contents), daemon=True).start()
+    return {"batch_id": batch_id, "total_pages": total}
+
+
+@app.get("/api/batches/{batch_id}")
+def get_batch(batch_id: str, since: int = 0):
+    """`since` = số trang đã nhận; chỉ trả các trang có số thứ tự lớn hơn."""
+    with BATCHES_LOCK:
+        job = BATCHES.get(batch_id)
+        if job is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Không tìm thấy lô PDF (có thể máy chủ đã khởi động lại). Hãy mở lại file PDF.",
+            )
+        pages = {n: r for n, r in job["pages"].items() if n > since}
+        return {
+            "status": job["status"], "total": job["total"], "done": job["done"],
+            "error": job["error"], "pages": pages,
+        }
 
 
 class ItemModel(BaseModel):
@@ -541,6 +878,168 @@ def save_page(data: PageDataModel):
         db.rollback()
         log.error("LỖI KHI LƯU TRANG:\n%s", traceback.format_exc())
         raise HTTPException(status_code=500, detail="Không lưu được dữ liệu trang")
+    finally:
+        db.close()
+
+
+# ======================================================================
+# DANH MỤC HÀNG, THÔNG TIN CAN PHẠM, LƯU PHIẾU CHI (bảng cha + bảng con)
+# ======================================================================
+@app.get("/api/products")
+def get_products():
+    """Các mặt hàng đang bật (status = on), kèm giá bán."""
+    db = SessionLocal()
+    try:
+        items = load_master_items(db)
+    finally:
+        db.close()
+    data = [
+        {"ma": i["ma"], "ten": i["ten"], "dvt": i["dvt"], "gia": i["gia"]}
+        for i in items
+        if i["on"] and i["ma"]
+    ]
+    data.sort(key=lambda x: natural_key(x["ma"]))
+    return {"count": len(data), "data": data}
+
+
+@app.get("/api/person/{stt}")
+def get_person(stt: str):
+    db = SessionLocal()
+    try:
+        person = fetch_person(db, stt.strip())
+    except HTTPException:
+        raise
+    except Exception:
+        db.rollback()
+        log.error("Lỗi truy vấn _A2 (STT=%s):\n%s", stt, traceback.format_exc())
+        raise HTTPException(status_code=500, detail="Không đọc được thông tin can phạm")
+    finally:
+        db.close()
+    if person is None:
+        return {"found": False, "stt": stt}
+    return {"found": True, "stt": stt, **person}
+
+
+class SaveItem(BaseModel):
+    ma: str = Field(..., min_length=1, max_length=100)
+    sl: int = Field(..., ge=1, le=100000)
+
+
+class SavePhieuModel(BaseModel):
+    batch_id: str = Field(..., min_length=1, max_length=64)
+    page: int = Field(..., ge=1)
+    stt: str = Field(..., min_length=1, max_length=64)
+    items: List[SaveItem]
+    force: bool = False  # True = vẫn lưu dù STT này đã có phiếu trong ngày
+
+
+@app.post("/api/save-phieu")
+def save_phieu(data: SavePhieuModel):
+    """Lưu một phiếu: 1 dòng bảng cha phieu_chi + các dòng bảng con phieu_chi_ct.
+    Tên hàng, ĐVT, giá và thông tin can phạm luôn lấy từ DB (không tin dữ liệu từ trình duyệt).
+    Lưu lại cùng (batch_id, page) sẽ ghi đè phiếu cũ."""
+    if not data.items:
+        raise HTTPException(status_code=400, detail="Phiếu chưa có mặt hàng nào")
+
+    db = SessionLocal()
+    try:
+        by_ma = {i["ma"]: i for i in load_master_items(db) if i["ma"]}
+
+        stt = data.stt.strip()
+        person = fetch_person(db, stt)
+        if person is None:
+            raise HTTPException(status_code=404, detail=f"Không tìm thấy STT {stt} trong bảng _A2")
+
+        merged, missing = {}, []
+        for it in data.items:
+            ma = it.ma.strip()
+            if ma not in by_ma:
+                missing.append(ma)
+                continue
+            merged[ma] = merged.get(ma, 0) + it.sl
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail="Mã hàng không có trong danh mục: " + ", ".join(missing[:5]),
+            )
+
+        details, tong_sl, tong_tien = [], 0, 0
+        for ma in sorted(merged, key=natural_key):
+            m, sl = by_ma[ma], merged[ma]
+            thanh_tien = sl * m["gia"]
+            details.append({
+                "ma_hang": ma, "ten_hang": m["ten"], "dvt": m["dvt"],
+                "so_luong": sl, "gia": m["gia"], "thanh_tien": thanh_tien,
+            })
+            tong_sl += sl
+            tong_tien += thanh_tien
+
+        today = datetime.now(VN_TZ).date()
+
+        if not data.force:
+            dup = db.execute(
+                text(
+                    "SELECT id FROM phieu_chi WHERE stt = :stt AND ngay = :ngay "
+                    "AND NOT (batch_id = :b AND page = :p) LIMIT 1"
+                ),
+                {"stt": stt, "ngay": today, "b": data.batch_id, "p": data.page},
+            ).fetchone()
+            if dup:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"STT {stt} đã có phiếu chi ngày {today:%d/%m/%Y} (phiếu #{dup[0]})",
+                )
+
+        row = db.execute(
+            text("""
+                INSERT INTO phieu_chi
+                    (batch_id, page, loai, stt, ngay, ho_ten, ngay_sinh, gioi_tinh, noi_tt,
+                     hanh_vi, ngay_bat, buong_giam, tgiam, tong_so_luong, so_tien, so_tien_bang_chu)
+                VALUES
+                    (:batch_id, :page, 'Chi', :stt, :ngay, :ho_ten, :ngay_sinh, :gioi_tinh, :noi_tt,
+                     :hanh_vi, :ngay_bat, :buong_giam, :tgiam, :tong_sl, :so_tien, :bang_chu)
+                ON CONFLICT (batch_id, page) DO UPDATE SET
+                    stt = EXCLUDED.stt, ngay = EXCLUDED.ngay, ho_ten = EXCLUDED.ho_ten,
+                    ngay_sinh = EXCLUDED.ngay_sinh, gioi_tinh = EXCLUDED.gioi_tinh,
+                    noi_tt = EXCLUDED.noi_tt, hanh_vi = EXCLUDED.hanh_vi,
+                    ngay_bat = EXCLUDED.ngay_bat, buong_giam = EXCLUDED.buong_giam,
+                    tgiam = EXCLUDED.tgiam, tong_so_luong = EXCLUDED.tong_so_luong,
+                    so_tien = EXCLUDED.so_tien, so_tien_bang_chu = EXCLUDED.so_tien_bang_chu,
+                    updated_at = now()
+                RETURNING id
+            """),
+            {
+                "batch_id": data.batch_id, "page": data.page, "stt": stt, "ngay": today,
+                "ho_ten": person["hoTen"], "ngay_sinh": person["ngaySinh"],
+                "gioi_tinh": person["gioiTinh"], "noi_tt": person["noiTT"],
+                "hanh_vi": person["hanhVi"], "ngay_bat": person["ngayBat"],
+                "buong_giam": person["buongGiam"], "tgiam": person["tGiam"],
+                "tong_sl": tong_sl, "so_tien": tong_tien, "bang_chu": money_to_words(tong_tien),
+            },
+        ).fetchone()
+        phieu_id = row[0]
+
+        db.execute(text("DELETE FROM phieu_chi_ct WHERE phieu_id = :id"), {"id": phieu_id})
+        db.execute(
+            text("""
+                INSERT INTO phieu_chi_ct (phieu_id, ma_hang, ten_hang, dvt, so_luong, gia, thanh_tien)
+                VALUES (:phieu_id, :ma_hang, :ten_hang, :dvt, :so_luong, :gia, :thanh_tien)
+            """),
+            [{"phieu_id": phieu_id, **d} for d in details],
+        )
+        db.commit()
+        return {
+            "ok": True, "phieu_id": phieu_id, "ho_ten": person["hoTen"],
+            "tong_so_luong": tong_sl, "so_tien": tong_tien,
+            "so_tien_bang_chu": money_to_words(tong_tien),
+        }
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        log.error("LỖI KHI LƯU PHIẾU CHI:\n%s", traceback.format_exc())
+        raise HTTPException(status_code=500, detail="Không lưu được phiếu chi")
     finally:
         db.close()
 
