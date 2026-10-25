@@ -1,10 +1,10 @@
 fastapi
-uvicorn
+uvicorn[standard]
 python-multipart
 pymupdf
-pytesseract
 opencv-python-headless
 numpy
-psycopg2-binary
-sqlalchemy
 pyzbar
+pytesseract
+sqlalchemy
+psycopg2-binary
