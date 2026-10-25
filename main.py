@@ -353,29 +353,52 @@ def lookup_customer(db, stt: str) -> str:
     return f"Mã QR [{stt}] không tồn tại trong bảng _A2"
 
 
+# Các ký tự OCR hay nhầm với chữ số, dùng khi so khớp mã hàng
+_CONFUSION = str.maketrans({"O": "0", "I": "1", "L": "1", "S": "5", "B": "8", "Z": "2"})
+
+
+def _confuse(key: str) -> str:
+    return key.translate(_CONFUSION)
+
+
 def merge_ocr_into_items(master_items: list, ocr_rows: list) -> list:
-    """Điền số lượng OCR vào danh mục; dòng không khớp được thêm vào cuối."""
-    items = copy.deepcopy(master_items)
-    by_code = {norm_code(it["ma"]): it for it in items if it["ma"]}
+    """Chỉ trả các mã hàng OCR được trên phiếu, ánh xạ sang bảng danh mục để lấy tên/ĐVT."""
+    by_code, by_conf = {}, {}
+    for it in master_items:
+        if not it["ma"]:
+            continue
+        k = norm_code(it["ma"])
+        by_code[k] = it
+        by_conf.setdefault(_confuse(k), it)
     keys = list(by_code.keys())
 
+    items, seen = [], {}
     for code, qty in ocr_rows:
         key = norm_code(code)
-        item, status = by_code.get(key), "Khớp DB"
-        if item is None and keys:
+        master, status = by_code.get(key), "Khớp DB"
+        if master is None:
+            master, status = by_conf.get(_confuse(key)), "Khớp gần đúng"
+        if master is None and keys:
             close = difflib.get_close_matches(key, keys, n=1, cutoff=0.85)
             if close:
-                item, status = by_code[close[0]], "Khớp gần đúng"
-        if item is not None:
-            item["sl"] += qty
-            item["trangThai"] = status
+                master, status = by_code[close[0]], "Khớp gần đúng"
+
+        if master is not None:
+            uid = master["ma"]
+            if uid in seen:
+                seen[uid]["sl"] += qty
+                continue
+            row = {"ma": master["ma"], "ten": master["ten"], "dvt": master["dvt"],
+                   "sl": qty, "trangThai": status, "maOcr": code}
         else:
-            items.append({
-                "ma": code, "ten": "", "dvt": "", "sl": qty,
-                "trangThai": "Không có trong DB",
-            })
-            by_code[key] = items[-1]
-            keys.append(key)
+            uid = "?" + key
+            if uid in seen:
+                seen[uid]["sl"] += qty
+                continue
+            row = {"ma": code, "ten": "", "dvt": "", "sl": qty,
+                   "trangThai": "Không có trong DB", "maOcr": code}
+        seen[uid] = row
+        items.append(row)
     return items
 
 
@@ -416,7 +439,7 @@ def process_pdf(file: UploadFile = File(...)):
             if img is None:
                 ocr_database[page_no] = {
                     "ten": "Không đọc được trang", "tienCon": "0 đ",
-                    "items": copy.deepcopy(master_items),
+                    "items": [],
                     "canhBao": ["Không render được trang PDF"],
                 }
                 continue
